@@ -1,2 +1,9 @@
 ipykernel
 requests
+sounddevice
+numpy
+openai
+python-dotenv
+websockets
+elevenlabs
+pyaudio
