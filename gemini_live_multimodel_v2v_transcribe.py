@@ -30,7 +30,7 @@ import sys
 import traceback
 import pyaudio
 from google import genai
-from google.genai.types import LiveConnectConfig, HttpOptions, Modality, SpeechConfig
+from google.genai.types import LiveConnectConfig, HttpOptions, Modality, SpeechConfig, AudioTranscriptionConfig
 import os
 from dotenv import load_dotenv
 
@@ -74,7 +74,11 @@ else:
         http_options={"api_version": "v1alpha"}
     )
     MODEL = "models/gemini-2.0-flash-live-001"
-    CONFIG = LiveConnectConfig(response_modalities=[Modality.AUDIO], system_instruction="Anda seorang agen yang berkerja di Bank HSBC yang berbahasa Malaysia. Berikan jawaban dalam bahasa Malaysia yang formal dan dengan menggunakan bahasa yang sopan dan mesra.")
+    CONFIG = LiveConnectConfig(
+    response_modalities=[Modality.AUDIO],
+    system_instruction="Anda seorang agen yang berkerja di Bank HSBC yang berbahasa Malaysia. Berikan jawaban dalam bahasa Malaysia yang formal dan dengan menggunakan bahasa yang sopan dan mesra.",
+    output_audio_transcription=AudioTranscriptionConfig(),
+    )
     
 
 
@@ -115,21 +119,97 @@ class AudioLoop:
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
     
     async def receive_audio(self):
-        """Receives audio responses from Gemini."""
+        """Receives audio responses AND TRANSCRIPTIONS from Gemini, assembling fragments."""
+        print("--- Listening for Gemini responses and transcriptions ---")
+
+        # --- Reset transcription accumulators before processing each new turn stream ---
+        # These will now build up the text from fragments during the turn processing.
+        current_user_text = ""
+        current_gemini_text = ""
+        gemini_started_speaking_on_line = False # Flag to help manage console line breaks
+
         while True:
-            # Get next response from Gemini
-            turn = self.session.receive()
-            
-            async for response in turn:
-                # Handle audio data
-                if data := response.data:
-                    self.audio_in_queue.put_nowait(data)
-                
-                # Handle text (if model includes it)
-                if text := response.text:
-                    print("Gemini:", text, end="")
-            
-            print()  # New line after Gemini's turn completes
+            # Reset accumulators at the start of EACH new turn stream from receive()
+            current_user_text = ""
+            current_gemini_text = ""
+            gemini_started_speaking_on_line = False
+
+            try:
+                turn = self.session.receive() # Get the async iterator for the turn
+
+                async for response in turn:
+                    # --- 1. Process Audio Data ---
+                    if data := response.data:
+                        self.audio_in_queue.put_nowait(data)
+
+                    # --- 2. Extract Transcription Fragments (if available) ---
+                    user_text_fragment = None
+                    gemini_text_fragment = None
+
+                    if hasattr(response, 'server_content') and response.server_content:
+                        server_content = response.server_content
+                        if hasattr(server_content, 'input_transcription') and server_content.input_transcription:
+                            # *** This is likely JUST the fragment ***
+                            user_text_fragment = server_content.input_transcription.text
+                        if hasattr(server_content, 'output_transcription') and server_content.output_transcription:
+                            # *** This is likely JUST the fragment ***
+                            gemini_text_fragment = server_content.output_transcription.text
+
+                    # --- 3. Accumulate and Print User Transcription ---
+                    if user_text_fragment: # Check if fragment is not None/empty string
+                        # *** ACCUMULATE the fragment ***
+                        current_user_text += user_text_fragment
+                        print(f"\rUser: {current_user_text}        ", end="", flush=True)
+                        gemini_started_speaking_on_line = False # Reset flag
+
+                    # --- 4. Accumulate and Print Gemini Transcription ---
+                    if gemini_text_fragment: # Check if fragment is not None/empty string
+                        # If this is the first Gemini fragment after user text, move to a new line
+                        if not gemini_started_speaking_on_line:
+                            # Avoid extra newline if user didn't say anything this turn
+                            if current_user_text:
+                                print() # Move cursor off the user's line
+                            gemini_started_speaking_on_line = True # Mark that Gemini is now 'owning' the line
+
+                        # *** ACCUMULATE the fragment ***
+                        current_gemini_text += gemini_text_fragment
+                        print(f"\rGemini (Transcription): {current_gemini_text}        ", end="", flush=True)
+
+                    # --- 5. Handle Final Text (response.text) ---
+                    # This might be the final *word* or just confirmation text, print it distinctly
+                    if final_text := response.text:
+                        # Ensure we are on a new line before printing this block text
+                        if gemini_started_speaking_on_line:
+                             # Clear the accumulated transcription line first
+                             print(f"\r{' ' * 80}\r", end="")
+                        elif current_user_text: # Or if user was last speaking
+                             print() # Move off the user line
+
+                        print(f"Gemini (Final Text): {final_text}", flush=True) # Prints with newline
+                        # Resetting gemini state here might be premature if more fragments follow
+                        # Let the reset at the start of the while loop handle full clearing.
+                        gemini_started_speaking_on_line = False # Reset flag
+
+                # --- Optional: Action after processing all responses in the 'turn' stream ---
+                # Add a final newline if the last thing printed was using end=""
+                if current_user_text and not gemini_started_speaking_on_line:
+                     print(flush=True)
+                elif current_gemini_text:
+                     print(flush=True)
+                print("--- Turn Processed ---")
+
+
+            except StopAsyncIteration:
+                print("\n--- StopAsyncIteration (End of Turn Stream) ---")
+                # The loop will continue and reset accumulators at the top
+                continue
+            except Exception as e:
+                print(f"\nError in receive_audio: {e}")
+                traceback.print_exc()
+                break # Exit the loop on other errors
+
+        print("--- Exited receive_audio loop ---")
+
     
     async def play_audio(self):
         """Plays audio responses through speakers."""
